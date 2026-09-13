@@ -1,0 +1,14 @@
+torch==2.11.0
+torchvision==0.26.0
+numpy==2.4.6
+pandas==3.0.5
+scikit-learn==1.9.0
+pillow==11.3.0
+tqdm==4.67.1
+matplotlib==3.10.6
+requests==2.32.5
+
+# optional, enabled automatically when present
+# opencv-python==4.11.0.86   # CLAHE contrast enhancement (--clahe)
+# pycocoevalcap==1.2         # reference BLEU/ROUGE-L/CIDEr implementations
+# pydicom==3.0.1             # MIMIC-CXR DICOM reading
