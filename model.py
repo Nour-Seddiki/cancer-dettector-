@@ -301,13 +301,32 @@ class ReportGenerator(nn.Module):
 
     # -- generation ----------------------------------------------------------------------
 
+    @staticmethod
+    def _block_repeated_ngrams(seqs, scores, n):
+        """Set to -inf every next token that would repeat an n-gram already in its row.
+
+        The decoder occasionally loops ("left lung is clear. left lung is clear."), and
+        greedy decoding has no way back out once it has started to repeat a phrase.
+        """
+        for b, row in enumerate(seqs.tolist()):
+            prefix = row[len(row) - (n - 1):]
+            banned = [row[i + n - 1] for i in range(len(row) - n + 1)
+                      if row[i:i + n - 1] == prefix]
+            if banned:
+                scores[b, banned] = float("-inf")
+        return scores
+
     @torch.no_grad()
     def generate(self, images, max_new_tokens, bos_token_id, eos_token_id=None,
-                 beam_size=1, length_penalty=0.6, context=None):
+                 beam_size=1, length_penalty=0.6, context=None, no_repeat_ngram=3):
+        """Greedy (beam_size=1) or beam decoding. `no_repeat_ngram` > 1 forbids generating
+        any n-gram of that length twice in one report (0 = off). 3 won a val sweep over
+        {off, 3, 4, 5, 6} for v5a: repeated 4-grams 1.4% -> 0, CE micro F1 0.338 -> 0.352."""
         context = self.encode_image(images) if context is None else context
         if beam_size > 1:
             return self._generate_beam(context, max_new_tokens, bos_token_id,
-                                       eos_token_id, beam_size, length_penalty)
+                                       eos_token_id, beam_size, length_penalty,
+                                       no_repeat_ngram)
 
         B = context.shape[0]
         device = context.device
@@ -316,7 +335,11 @@ class ReportGenerator(nn.Module):
 
         for _ in range(max_new_tokens):
             logits = self.decode(generated[:, -self.block_size:], context)
-            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_logits = logits[:, -1, :].float()
+            if no_repeat_ngram > 1:
+                next_logits = self._block_repeated_ngrams(generated, next_logits,
+                                                          no_repeat_ngram)
+            next_token = next_logits.argmax(dim=-1, keepdim=True)
             if eos_token_id is not None:
                 next_token[finished] = eos_token_id
                 finished = finished | (next_token.squeeze(-1) == eos_token_id)
@@ -327,7 +350,7 @@ class ReportGenerator(nn.Module):
 
     @torch.no_grad()
     def _generate_beam(self, context, max_new_tokens, bos_token_id, eos_token_id,
-                       beam_size, length_penalty):
+                       beam_size, length_penalty, no_repeat_ngram=0):
         """Batched beam search, ranked by length-normalised cumulative log-prob.
 
         Same implementation as `transformer/model.py`; the only difference is that the
@@ -353,6 +376,11 @@ class ReportGenerator(nn.Module):
             logits = self.decode(beams[:, -self.block_size:], context)
             log_probs = F.log_softmax(logits[:, -1, :].float(), dim=-1)
             V = log_probs.shape[-1]
+
+            active = ~finished
+            if no_repeat_ngram > 1 and active.any():
+                log_probs[active] = self._block_repeated_ngrams(
+                    beams[active], log_probs[active], no_repeat_ngram)
 
             if finished.any():
                 # A finished beam may only continue by re-emitting eos at no score cost.

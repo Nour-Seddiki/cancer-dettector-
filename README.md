@@ -278,25 +278,36 @@ python tune_thresholds.py --checkpoint checkpoints/rg_v5a_phase2.pt   # val
 python evaluate.py --checkpoint checkpoints/rg_v5a_phase2.pt --split test
 ```
 
-Test split (332 studies, rule-based CE labeller, thresholds tuned on val and the test split
-scored once):
+Two fixes came out of testing examples by hand:
+
+- **Labeller:** "the heart is mildly enlarged" and "heart is large" did not count as
+  cardiomegaly, because the pattern allowed no degree word between the verb and
+  "enlarged". Against the shipped MeSH labels, cardiomegaly recall goes from 0.857 to
+  0.939 at unchanged precision. Every number below uses the fixed labeller.
+- **Repetition:** reports sometimes looped ("left lung is clear. left lung is clear.").
+  Decoding now forbids repeating any 3-gram (`no_repeat_ngram=3`, the winner of a val
+  sweep over off/3/4/5/6). Repeated 4-grams drop from 1.4% to 0, and val CE micro F1
+  moves from 0.338 to 0.352.
+
+Test split (332 studies, rule-based CE labeller, thresholds tuned on val, test scored once
+per model):
 
 | | v2, beam 3 (previous) | v2, greedy | **v5a** |
 |---|---|---|---|
-| CE micro P / R / F1 | 0.636 / 0.026 / 0.051 | 0.465 / 0.125 / 0.196 | 0.333 / 0.302 / **0.317** |
-| CE macro F1 | 0.029 | 0.104 | 0.171 |
-| distinct reports | 9.3% | 17.2% | 26.8% |
-| BLEU-1 / BLEU-4 | 0.212 / 0.060 | 0.191 / 0.061 | 0.241 / 0.070 |
-| ROUGE-L / CIDEr | 0.237 / 0.258 | 0.261 / 0.359 | 0.256 / 0.309 |
+| CE micro P / R / F1 | 0.692 / 0.034 / 0.065 | 0.479 / 0.132 / 0.206 | 0.323 / 0.323 / **0.323** |
+| CE macro F1 | 0.035 | 0.108 | 0.202 |
+| distinct reports | 9.3% | 17.2% | 25.9% |
+| BLEU-1 / BLEU-4 | 0.212 / 0.060 | 0.191 / 0.061 | 0.246 / 0.071 |
+| ROUGE-L / CIDEr | 0.237 / 0.258 | 0.261 / 0.359 | 0.255 / 0.310 |
 
-Recall on abnormal findings went from 2.6% to 30%. By condition, v5a scores F1 of 0.43
-on cardiomegaly, 0.43 on lung opacity, 0.44 on atelectasis and 0.36 on pleural effusion.
-The classifier head is now the ceiling: its own thresholded micro F1 on val is 0.39 and
-the reports reach 0.34. It still misses almost all lung lesions (F1 0.06), pneumothorax,
-pneumonia and fractures, writes some findings into normal studies, and occasionally
-repeats itself (1.2% repeated 4-grams). The next levers are a stronger classifier (higher
-input resolution, test-time augmentation) and scoring with CheXbert instead of the
-rule-based labeller.
+Recall on abnormal findings went from 3.4% to 32%, and v5a has no repeated 4-grams. By
+condition, v5a scores F1 0.46 on cardiomegaly, 0.44 on lung opacity, 0.41 on atelectasis
+and 0.34 on pleural effusion. The classifier head is now the ceiling: its own thresholded
+micro F1 on val is 0.39, and the reports reach 0.35. The model still misses almost all
+lung lesions (F1 0.06), pneumothorax, pneumonia and fractures, and it writes some findings
+into normal studies. The next levers are a stronger classifier (higher input resolution,
+test-time augmentation) and scoring with CheXbert instead of the rule-based labeller.
+`IMPROVEMENT_LOG.md` tracks the experiments.
 
 ## References
 

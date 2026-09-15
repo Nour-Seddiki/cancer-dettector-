@@ -41,6 +41,12 @@ NUM_CONDITIONS = len(CONDITIONS)
 COND_INDEX = {c: i for i, c in enumerate(CONDITIONS)}
 NO_FINDING_IDX = COND_INDEX["No Finding"]
 
+# Optional linking verb and degree words between a structure and its size adjective:
+# "the heart is mildly enlarged", "heart size remains markedly enlarged".
+_VERB = r"(?:is |are |appears |remains )?"
+_DEGREE = (r"(?:(?:mildly|moderately|markedly|severely|slightly|minimally|significantly|"
+           r"massively|borderline|again|still|now) )*")
+
 # Keyword patterns per condition, matched against lowercased text.
 # A single hit anywhere in a sentence sets the condition for the whole report.
 PATTERNS = {
@@ -53,8 +59,14 @@ PATTERNS = {
     "Cardiomegaly": [
         r"cardiomegaly",
         r"enlarged (?:cardiac|heart)",
-        r"(?:cardiac|heart) (?:size |silhouette )?(?:is |are )?enlarge\w*",
+        # Degree words ("heart is mildly enlarged") and plain "large": without them recall
+        # against the shipped MeSH labels was 0.857, with them 0.939, at unchanged
+        # precision (0.966 -> 0.969). The same change to the cardiomediastinum pattern
+        # only added false positives, so that one stays strict.
+        rf"(?:cardiac|heart) (?:size |silhouette )?{_VERB}{_DEGREE}enlarge\w*",
         r"enlargement of the (?:cardiac|heart)",
+        rf"(?:cardiac|heart) (?:size |silhouette )?{_VERB}{_DEGREE}large\b",
+        r"\blarge (?:cardiac|heart)\b",
     ],
     "Lung Opacity": [
         r"opacit\w+", r"opacification", r"airspace disease", r"air space disease",
