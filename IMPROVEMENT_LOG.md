@@ -16,7 +16,9 @@ This file holds the rules, the current best model, the queue and every result so
 - New checkpoints get new names (`rg_vN_*`, `classifier_vN.pt`). Never overwrite an old one.
 - Run Python with the signed interpreter and the venv on `PYTHONPATH`
   (`C:\Users\seddi\AppData\Local\Programs\Python\Python314\python.exe`). Pin long background
-  runs to P-cores with affinity `0x0FFF`.
+  runs to P-cores with affinity `0x0FFF`. Use `--num-workers 2` for report-generator
+  training: with 4 workers, phase 2 of v8 was killed for low system memory (other apps on
+  this laptop hold ~6 GB of the 15.6 GB).
 
 ## Current best
 
@@ -30,17 +32,12 @@ is in the README "v5" section.
 
 ## Queue (highest expected value first)
 
-1. **Match the decoder's token semantics to a text-label head.** Warm-start from
-   `classifier_v3.pt` (already trained, on disk) and train with `--teacher-source text`,
-   with the auxiliary BCE also on the text labels (needs an `--aux-source text` option in
-   `training.py`). v7 showed the v3 head is better (0.422 against 0.391) but the decoder,
-   taught on manifest-label tokens, passed less of it through.
-2. **Higher input resolution.** For example 320px, which gives a 10x10 grid of 100 image
+1. **Higher input resolution.** For example 320px, which gives a 10x10 grid of 100 image
    tokens. This needs `GRID` and `NUM_REGIONS` to follow the input size.
-3. **Auxiliary-loss weight sweep** (0.5, 2.0) on the v5a recipe.
-4. **Seed ensemble of the head.** Average the probabilities of 2-3 phase-2 runs.
-5. **Decoder regularisation:** dropout 0.2, or 2 layers.
-6. **Retest head TTA on the next accepted model.** Zoom 0.1 was a near-miss on v5a (see
+2. **Auxiliary-loss weight sweep** (0.5, 2.0) on the v5a recipe.
+3. **Seed ensemble of the head.** Average the probabilities of 2-3 phase-2 runs.
+4. **Decoder regularisation:** dropout 0.2, or 2 layers.
+5. **Retest head TTA on the next accepted model.** Zoom 0.1 was a near-miss on v5a (see
    History); the method is described in the v6 note and is inference only.
 
 ## History
@@ -56,6 +53,7 @@ is in the README "v5" section.
 | v5a | fixed cardiomegaly labeller + `no_repeat_ngram=3` | 0.352 | 0.323 | accepted |
 | v6a / v6b | head TTA at inference, zoom 0.10 / 0.15 | 0.366 / 0.363 | - | rejected, near-miss |
 | v7 | warm-start from `classifier_v3` (trained on text labels), v5a recipe | 0.301 | - | rejected |
+| v8 | `classifier_v3` + text-label tokens + text-label aux BCE | 0.346 | - | rejected |
 
 \* Scored before the labeller fix. Test numbers for v2 were re-scored with the fixed labeller.
 
@@ -76,6 +74,14 @@ text labels. Warm-started from it, the v5a recipe gave a better head, with thres
 micro F1 on val of 0.422 (was 0.391; cardiomegaly 0.575, lung opacity 0.473, atelectasis
 0.480). The reports were worse, though: CE micro P / R / F1 0.416 / 0.236 / 0.301 and macro
 0.188. The decoder passed through 71% of the head's F1, where v5a passed about 90%. The
-likely cause is that the decoder was taught with manifest-label tokens while the head now
-predicts text labels, and the aux BCE on manifest labels pulls the head back. Queue item 1
-tests matching them.
+likely cause was that the decoder was taught with manifest-label tokens while the head
+predicted text labels, and the aux BCE on manifest labels pulled the head back.
+
+**v8 (text labels end to end).** It tested that explanation: the same `classifier_v3`
+warm start, with the condition tokens during training (`--teacher-source text`) and the
+aux BCE (an `--aux-source text` option, reverted) both on text labels. Matching the
+labels did restore the pass-through, with reports at 85% of the head's F1 (0.346 of 0.408),
+but the head itself ended weaker than v7's, at 0.408. The reports came out at CE micro P /
+R / F1 0.320 / 0.377 / 0.346 and macro 0.200. That is higher recall than v5a but lower
+precision, and below it overall. With v5b, v7 and v8 all short of the manifest-label v5a,
+text-derived labels are not a lever at this data size, and that line is closed.
