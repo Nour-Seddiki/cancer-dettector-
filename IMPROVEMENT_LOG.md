@@ -16,9 +16,12 @@ This file holds the rules, the current best model, the queue and every result so
 - New checkpoints get new names (`rg_vN_*`, `classifier_vN.pt`). Never overwrite an old one.
 - Run Python with the signed interpreter and the venv on `PYTHONPATH`
   (`C:\Users\seddi\AppData\Local\Programs\Python\Python314\python.exe`). Pin long background
-  runs to P-cores with affinity `0x0FFF`. Use `--num-workers 2` for report-generator
-  training: with 4 workers, phase 2 of v8 was killed for low system memory (other apps on
-  this laptop hold ~6 GB of the 15.6 GB).
+  runs to P-cores with affinity `0x0FFF`.
+- **Memory:** other apps on this laptop hold about 6.4 GB of the 15.6 GB of RAM
+  (`GiMATE_llm` / `GiMATE_ai`), and the harness kills background runs when free memory
+  runs low. Phase 2 of report training was killed with 4 loader workers (v8) and again
+  with 2 (v9), so run phase 2 with `--num-workers 0`. Phase 1 and the classifier survived
+  with 2 workers.
 
 ## Current best
 
@@ -32,12 +35,10 @@ is in the README "v5" section.
 
 ## Queue (highest expected value first)
 
-1. **Higher input resolution.** For example 320px, which gives a 10x10 grid of 100 image
-   tokens. This needs `GRID` and `NUM_REGIONS` to follow the input size.
-2. **Auxiliary-loss weight sweep** (0.5, 2.0) on the v5a recipe.
-3. **Seed ensemble of the head.** Average the probabilities of 2-3 phase-2 runs.
-4. **Decoder regularisation:** dropout 0.2, or 2 layers.
-5. **Retest head TTA on the next accepted model.** Zoom 0.1 was a near-miss on v5a (see
+1. **Auxiliary-loss weight sweep** (0.5, 2.0) on the v5a recipe.
+2. **Seed ensemble of the head.** Average the probabilities of 2-3 phase-2 runs.
+3. **Decoder regularisation:** dropout 0.2, or 2 layers.
+4. **Retest head TTA on the next accepted model.** Zoom 0.1 was a near-miss on v5a (see
    History); the method is described in the v6 note and is inference only.
 
 ## History
@@ -54,6 +55,7 @@ is in the README "v5" section.
 | v6a / v6b | head TTA at inference, zoom 0.10 / 0.15 | 0.366 / 0.363 | - | rejected, near-miss |
 | v7 | warm-start from `classifier_v3` (trained on text labels), v5a recipe | 0.301 | - | rejected |
 | v8 | `classifier_v3` + text-label tokens + text-label aux BCE | 0.346 | - | rejected |
+| v9 | 320px input throughout (`classifier_v4` + v5a recipe, 100 image tokens) | 0.305 | - | rejected |
 
 \* Scored before the labeller fix. Test numbers for v2 were re-scored with the fixed labeller.
 
@@ -85,3 +87,14 @@ but the head itself ended weaker than v7's, at 0.408. The reports came out at CE
 R / F1 0.320 / 0.377 / 0.346 and macro 0.200. That is higher recall than v5a but lower
 precision, and below it overall. With v5b, v7 and v8 all short of the manifest-label v5a,
 text-derived labels are not a lever at this data size, and that line is closed.
+
+**v9 (320px input).** An `image_size` setting was threaded through the transforms,
+datasets, loaders, encoder grid, model config and every inference entry point, then
+reverted. At 320px the 10x10 grid gives 100 image tokens. `classifier_v4` was trained at
+320px with the classifier_v2 recipe unchanged (batch 32; peak VRAM for a batch of 16 was
+2.45 GB). It reached a best val mean AUROC of 0.716, against 0.709 at 224px. The v5a recipe
+at 320px, warm-started from it, gave a head with thresholded micro F1 0.404 on val (was
+0.391; pleural effusion 0.522, lung opacity 0.488). The reports were worse, though: CE
+micro P / R / F1 0.343 / 0.275 / 0.305 and macro 0.205, so the decoder passed through about
+75% of the head's F1. Pneumothorax and fracture stayed at zero even at 320px. At this data
+size, more pixels mainly give the decoder more tokens to attend over, not better findings.
