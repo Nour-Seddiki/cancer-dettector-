@@ -184,7 +184,60 @@ Implemented and verified end-to-end on synthetic data: manifest build, tokenizer
 teacher-forcing shift, frozen/unfrozen gradient flow, greedy + beam decoding, checkpoint
 round-trip, and all metrics (BLEU/ROUGE/CIDEr = max on identical text, ≈0 on mismatched).
 
-Not yet run: training on the real dataset.
+Trained on IU X-Ray (3,101 train / 374 val / 351 test studies, frontal only):
+phase 1 (CNN frozen) reached val loss 2.5053, phase 2 (denseblock4+norm5 unfrozen,
+lr 1e-4 / cnn-lr 1e-5) improved it to 2.4676. Both early-stopped; ~4.5 min total on
+the RTX 5050.
+
+**The trained model has mode-collapsed and is not clinically useful.** It emits 5
+distinct reports across all 351 test studies (`unique_report_frac` 0.014 vs 0.900 for
+references) and predicts "No Finding" for every one of them, so clinical efficacy is
+0.000 on all 13 abnormal conditions. NLG metrics beat the constant-boilerplate floor
+(BLEU-1 0.280 vs 0.140, ROUGE-L 0.240 vs 0.200) but fall *below* it on CIDEr
+(0.237 vs 0.266) - which is the giveaway that the gain is fluency, not grounding.
+
+This is the loss-optimal degenerate solution for a 3,101-study set that is 48%
+"No Finding": plain token cross-entropy is minimised by always writing the normal
+template. Next steps are abnormality-weighted sampling, the auxiliary BCE classifier
+loss from the plan's Section 4, and confirming the decoder is using the image at all
+rather than having learned a pure language prior.
+
+### v2: fixed view selection + a working stage (a) classifier
+
+Running the model on held-out X-rays (`python demo.py`) exposed two upstream bugs:
+
+- **15% of the "frontal-only" manifest was not frontal.** The old rule took each study's
+  lowest-sorting image id as its frontal, assuming ids follow acquisition order; they
+  don't. 589 of 3,826 rows were laterals (439 studies had the wrong image picked, 150 had
+  no frontal at all). `prepare_data.py` now reads the view from the pixels: a logistic
+  regression on 32×32 thumbnails, self-trained on the within-study mirror-symmetry gap
+  (grouped CV 0.99). Lateral-only studies are dropped. Splits are unchanged for every
+  remaining study: 2,983 train / 361 val / 332 test.
+- **`classifier.pt` was at chance** (mean AUROC 0.504). It was the epoch-0 checkpoint of a
+  run that died right after its frozen-backbone warm-up epoch, and the report generator
+  had been warm-started from it. The training code itself is fine: the full 15-epoch run
+  (`classifier_v2.pt`) reaches mean val AUROC 0.709, with Cardiomegaly 0.90, Pleural
+  Effusion 0.93 and Atelectasis 0.80.
+
+The report generator was retrained on the fixed data with the w3 recipe (abnormal studies
+oversampled ×3, frozen CNN, then denseblock4+norm5), warm-started from `classifier_v2.pt`,
+giving `rg_v2_phase2.pt` (val loss 2.5698). Scores below are on the test split (332
+studies, beam 3, rule-based CE labeller), with the previous model evaluated on the same
+split:
+
+| | `rg_w3_phase2` | `rg_v2_phase2` |
+|---|---|---|
+| distinct reports | 12 (3.6%) | 31 (9.3%) |
+| CE micro P / R / F1 | 0.200 / 0.004 / 0.007 | 0.636 / 0.026 / 0.051 |
+| Cardiomegaly F1 | 0.000 | 0.300 |
+| BLEU-1 / BLEU-4 | 0.155 / 0.051 | 0.212 / 0.060 |
+| ROUGE-L / CIDEr | 0.255 / 0.356 | 0.237 / 0.258 |
+
+v2 is better grounded and less collapsed, but it is still not useful: it reports only 2.6%
+of abnormal findings. The classifier on the same features now detects cardiomegaly and
+effusion well, yet the decoder rarely writes them. The bottleneck has therefore moved from
+the image features to the decoder's normal-template prior. Next steps are the auxiliary BCE
+loss from the plan and conditioning the decoder on the classifier's predictions.
 
 ## References
 

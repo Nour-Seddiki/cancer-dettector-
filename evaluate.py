@@ -38,6 +38,7 @@ def load_generator(checkpoint_path, device):
         n_head=cfg["n_head"], n_layer=cfg["n_layer"], block_size=cfg["block_size"],
         dropout=cfg["dropout"], pretrained_cnn=False,
         factorized_pos=cfg.get("factorized_pos", False),
+        label_tokens=cfg.get("label_tokens", False),
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -55,7 +56,7 @@ def generate_split(model, tokenizer, rows, device, batch_size=16, beam_size=3,
 
     hypotheses = []
     start = time.time()
-    for i, (images, _, _) in enumerate(loader):
+    for i, (images, *_) in enumerate(loader):
         images = images.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16,
                             enabled=(device.type == "cuda")):
@@ -98,7 +99,9 @@ def main():
     p.add_argument("--checkpoint", default=str(CKPT / "report_generator.pt"))
     p.add_argument("--split", default="test", choices=["train", "val", "test"])
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--beam-size", type=int, default=3)
+    # Greedy by default: beam search drifts to the highest-likelihood report, which here is
+    # the normal template. On val it cut clinical-efficacy micro F1 from 0.20 to 0.06 (v2).
+    p.add_argument("--beam-size", type=int, default=1)
     p.add_argument("--length-penalty", type=float, default=0.6)
     p.add_argument("--max-new-tokens", type=int, default=120)
     p.add_argument("--num-workers", type=int, default=2)

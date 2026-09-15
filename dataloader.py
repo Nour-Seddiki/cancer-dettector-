@@ -5,7 +5,7 @@ Covers PROJECT_PLAN.md Section 2 (image preprocessing) and the text half of Sect
 
 Two dataset flavours share the same image pipeline:
   * `CXRClassificationDataset` -> (image, label_vec)          for stage (a)
-  * `CXRReportDataset`         -> (image, tgt_in, tgt_out)    for stage (c)
+  * `CXRReportDataset`         -> (image, tgt_in, tgt_out, label_vec)  for stage (c)
 """
 
 import csv
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 
 from labels import CONDITIONS
@@ -249,6 +249,10 @@ def label_vector(row):
     return [float(row[f"lbl_{c.replace(' ', '_')}"]) for c in CONDITIONS]
 
 
+# Everything except "No Finding" - the conditions that make a study worth oversampling.
+ABNORMAL_INDICES = [i for i, c in enumerate(CONDITIONS) if c != "No Finding"]
+
+
 class _BaseCXRDataset(Dataset):
     def __init__(self, rows, train, data_root=DATA, clahe=False):
         self.rows = rows
@@ -272,7 +276,8 @@ class CXRClassificationDataset(_BaseCXRDataset):
 
 
 class CXRReportDataset(_BaseCXRDataset):
-    """Stage (c): image -> report token ids (variable length, padded by the collator)."""
+    """Stage (c): image -> report token ids (variable length, padded by the collator), plus
+    the study's 14-way label vector for the auxiliary classification loss."""
 
     def __init__(self, rows, tokenizer, train, max_len=160, data_root=DATA, clahe=False):
         super().__init__(rows, train=train, data_root=data_root, clahe=clahe)
@@ -282,31 +287,41 @@ class CXRReportDataset(_BaseCXRDataset):
     def __getitem__(self, i):
         row = self.rows[i]
         ids = self.tokenizer.encode(row["report"])[: self.max_len + 1]
-        return self._image(row), torch.tensor(ids, dtype=torch.long)
+        labels = torch.tensor(label_vector(row), dtype=torch.float32)
+        return self._image(row), torch.tensor(ids, dtype=torch.long), labels
 
 
-def make_collate_fn(pad_id):
-    """Pad a batch to its own longest sequence and build the shifted in/out pair.
+class Collator:
+    """Pads a batch to its own longest sequence and builds the shifted in/out pair.
 
     Padding to the batch max rather than a fixed block_size is the one real departure
-    from the translation project: report lengths here are very skewed (median ~35 words,
-    p95 ~90), so fixed-length padding would waste most of every batch.
+    from the translation project: report lengths here are very skewed (median 40 words,
+    p95 87), so fixed-length padding would waste most of every batch.
+
+    This is a class rather than the obvious closure because Windows DataLoader workers
+    start via spawn and pickle the collate_fn - a function defined inside another
+    function is not picklable, and every `num_workers > 0` run dies on it.
     """
 
-    def collate(batch):
-        images, seqs = zip(*batch)
+    def __init__(self, pad_id):
+        self.pad_id = pad_id
+
+    def __call__(self, batch):
+        images, seqs, labels = zip(*batch)
         images = torch.stack(images)
         longest = max(len(s) for s in seqs)
 
-        tgt_in = torch.full((len(seqs), longest - 1), pad_id, dtype=torch.long)
+        tgt_in = torch.full((len(seqs), longest - 1), self.pad_id, dtype=torch.long)
         tgt_out = torch.full((len(seqs), longest - 1), IGNORE_INDEX, dtype=torch.long)
         for i, s in enumerate(seqs):
             n = len(s) - 1
             tgt_in[i, :n] = s[:-1]
             tgt_out[i, :n] = s[1:]
-        return images, tgt_in, tgt_out
+        return images, tgt_in, tgt_out, torch.stack(labels)
 
-    return collate
+
+def make_collate_fn(pad_id):
+    return Collator(pad_id)
 
 
 def _vocab_fingerprint(train_reports, min_freq):
@@ -347,11 +362,17 @@ def build_tokenizer(rows=None, min_freq=3, rebuild=False, path=VOCAB_PATH):
 
 def make_report_loaders(batch_size=16, max_len=160, min_freq=3, num_workers=4,
                         clahe=False, limit=None, rows=None, data_root=DATA,
-                        vocab_path=VOCAB_PATH):
+                        vocab_path=VOCAB_PATH, abnormal_weight=1.0):
     """Train/val DataLoaders for stage (c), plus the tokenizer.
 
     `limit` truncates the training split - that is the tiny-overfit-subset debugging
     harness from plan weeks 4-5 (50-200 pairs until the model memorises them).
+
+    `abnormal_weight` > 1 oversamples studies carrying at least one of the 13 abnormal
+    conditions. The split is ~48% "No Finding", so plain cross-entropy is minimised by
+    always emitting the normal template - the model collapses onto boilerplate and
+    scores 0.000 clinical efficacy while its loss still looks reasonable. Reweighting
+    the sampler is the cheapest lever against that; 1.0 keeps the original behaviour.
     """
     rows = rows if rows is not None else read_manifest()
     tok = build_tokenizer(rows, min_freq=min_freq, path=vocab_path)
@@ -370,7 +391,16 @@ def make_report_loaders(batch_size=16, max_len=160, min_freq=3, num_workers=4,
     val_ds = CXRReportDataset(val_rows, tok, train=False, max_len=max_len,
                               clahe=clahe, data_root=data_root)
 
-    train_loader = DataLoader(train_ds, shuffle=True, drop_last=False, **common)
+    if abnormal_weight != 1.0 and not limit:
+        # Weight per study, not per condition: one positive finding is enough to make a
+        # study worth seeing more often.
+        weights = [abnormal_weight if any(label_vector(r)[i] for i in ABNORMAL_INDICES)
+                   else 1.0 for r in train_rows]
+        sampler = WeightedRandomSampler(weights, num_samples=len(train_rows),
+                                        replacement=True)
+        train_loader = DataLoader(train_ds, sampler=sampler, drop_last=False, **common)
+    else:
+        train_loader = DataLoader(train_ds, shuffle=True, drop_last=False, **common)
     val_loader = DataLoader(val_ds, shuffle=False, drop_last=False, **common)
     return train_loader, val_loader, tok
 
@@ -399,7 +429,7 @@ if __name__ == "__main__":
     print("most common:", tok.itos[4:24])
 
     train_loader, val_loader, tok = make_report_loaders(batch_size=4, num_workers=0, limit=8)
-    images, tgt_in, tgt_out = next(iter(train_loader))
+    images, tgt_in, tgt_out, labels = next(iter(train_loader))
     print(f"images {tuple(images.shape)}  tgt_in {tuple(tgt_in.shape)}  "
-          f"tgt_out {tuple(tgt_out.shape)}")
+          f"tgt_out {tuple(tgt_out.shape)}  labels {tuple(labels.shape)}")
     print("roundtrip:", tok.decode(tgt_in[0].tolist())[:160])

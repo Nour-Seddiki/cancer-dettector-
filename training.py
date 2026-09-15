@@ -17,6 +17,11 @@ Debug first, then scale (plan weeks 4-5):
     # phase 2, joint fine-tune from the phase-1 checkpoint
     python training.py --epochs 15 --resume checkpoints/report_generator.pt \
         --unfreeze-cnn --lr 1e-4 --cnn-lr 1e-5
+
+`--label-tokens` feeds the CNN classifier head's 14 condition probabilities to the decoder
+as extra context tokens, `--label-teacher-prob` swaps in the ground-truth labels for that
+fraction of training studies, and `--aux-weight` adds the plan's Section 4 auxiliary BCE
+loss on the head, which keeps its probabilities (and the features under them) grounded.
 """
 
 import argparse
@@ -24,10 +29,12 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from cnn_model import load_encoder
 from dataloader import make_report_loaders
 from model import ReportGenerator, block_size, count_parameters, dropout, n_emb, n_head, n_layer
+from train_classifier import pos_weight_from_rows
 from utils import (AverageMeter, EarlyStopping, cap_gpu_memory, cosine_lr, format_seconds,
                    get_device, keep_awake, save_checkpoint)
 
@@ -39,7 +46,7 @@ CKPT = ROOT / "checkpoints"
 def estimate_loss(model, loader, device, max_batches=None):
     model.eval()
     meter = AverageMeter()
-    for i, (images, tgt_in, tgt_out) in enumerate(loader):
+    for i, (images, tgt_in, tgt_out, _) in enumerate(loader):
         if max_batches and i >= max_batches:
             break
         images = images.to(device, non_blocking=True)
@@ -60,7 +67,7 @@ def sample_reports(model, loader, tokenizer, device, n=2, max_new_tokens=100):
     """Print a couple of generated/reference pairs - the fastest read on whether the model
     is producing radiology-shaped text or degenerate repetition."""
     model.eval()
-    images, tgt_in, tgt_out = next(iter(loader))
+    images, tgt_in, tgt_out, _ = next(iter(loader))
     images = images[:n].to(device)
     with torch.autocast(device_type=device.type, dtype=torch.float16,
                         enabled=(device.type == "cuda")):
@@ -87,6 +94,7 @@ def build_model(args, tokenizer, device):
         block_size=args.block_size, dropout=args.dropout,
         encoder=encoder, pretrained_cnn=True,
         factorized_pos=args.factorized_pos,
+        label_tokens=args.label_tokens,
     ).to(device)
 
     model.freeze_cnn()
@@ -95,6 +103,10 @@ def build_model(args, tokenizer, device):
         print("  CNN: denseblock4 + norm5 unfrozen (joint fine-tune)")
     else:
         print("  CNN: fully frozen (phase 1)")
+    if args.label_tokens:
+        print("  decoder context: 49 image tokens + 14 condition tokens"
+              + (f" (ground-truth labels for {args.label_teacher_prob:.0%} of training studies)"
+                 if args.label_teacher_prob > 0 else ""))
     return model
 
 
@@ -108,6 +120,9 @@ def main():
     p.add_argument("--clahe", action="store_true")
     p.add_argument("--overfit", type=int, default=0,
                    help="train on only N examples (architecture debugging, plan week 4)")
+    p.add_argument("--abnormal-weight", type=float, default=1.0,
+                   help="oversample studies with >=1 abnormal finding by this factor "
+                        "(1.0 = off). Counters collapse onto the normal-report template.")
     # model
     p.add_argument("--n-emb", type=int, default=n_emb)
     p.add_argument("--n-head", type=int, default=n_head)
@@ -116,6 +131,12 @@ def main():
     p.add_argument("--dropout", type=float, default=dropout)
     p.add_argument("--factorized-pos", action="store_true",
                    help="row/col-factored grid positional embedding instead of flat")
+    p.add_argument("--label-tokens", action="store_true",
+                   help="append the classifier head's 14 condition probabilities to the "
+                        "decoder context as extra tokens")
+    p.add_argument("--label-teacher-prob", type=float, default=0.0,
+                   help="fraction of training studies whose condition tokens use the "
+                        "ground-truth labels instead of the head's predictions")
     # optimisation
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -124,6 +145,8 @@ def main():
     p.add_argument("--warmup-frac", type=float, default=0.05)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--patience", type=int, default=6)
+    p.add_argument("--aux-weight", type=float, default=0.0,
+                   help="weight of the auxiliary BCE loss on the CNN classifier head (0 = off)")
     # phases / io
     p.add_argument("--cnn-checkpoint", default=None,
                    help="stage (a) classifier checkpoint to warm-start the encoder from")
@@ -143,9 +166,12 @@ def main():
     print("\nloading data...")
     train_loader, val_loader, tokenizer = make_report_loaders(
         batch_size=args.batch_size, max_len=args.max_len, min_freq=args.min_freq,
-        num_workers=args.num_workers, clahe=args.clahe, limit=args.overfit or None)
+        num_workers=args.num_workers, clahe=args.clahe, limit=args.overfit or None,
+        abnormal_weight=args.abnormal_weight)
     print(f"  vocab {tokenizer.vocab_size} tokens | "
           f"train {len(train_loader.dataset)} | val {len(val_loader.dataset)}")
+    if args.abnormal_weight != 1.0:
+        print(f"  oversampling abnormal studies x{args.abnormal_weight:g}")
     if args.overfit:
         print(f"  OVERFIT MODE: {args.overfit} examples, augmentation off, "
               f"val == train. Loss should approach 0.")
@@ -163,6 +189,12 @@ def main():
         print(f"  resumed from {args.resume} (epoch {start_epoch}, "
               f"val loss {ckpt.get('val_loss', float('nan')):.4f})")
 
+    bce = None
+    if args.aux_weight > 0:
+        pos_weight, _ = pos_weight_from_rows(train_loader.dataset.rows)
+        bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+        print(f"  auxiliary BCE on the classifier head, weight {args.aux_weight:g}")
+
     optimizer = torch.optim.AdamW(
         model.param_groups(args.lr, args.cnn_lr), weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
@@ -179,7 +211,8 @@ def main():
 
     for epoch in range(start_epoch, start_epoch + args.epochs):
         epoch_loss = AverageMeter()
-        for images, tgt_in, tgt_out in train_loader:
+        aux_loss = AverageMeter()
+        for images, tgt_in, tgt_out, labels in train_loader:
             lr = cosine_lr(it, args.lr, warmup_iters, max_iters)
             # Keep the CNN group at its own (much smaller) LR on the same schedule shape.
             optimizer.param_groups[0]["lr"] = lr
@@ -189,13 +222,20 @@ def main():
             images = images.to(device, non_blocking=True)
             tgt_in = tgt_in.to(device, non_blocking=True)
             tgt_out = tgt_out.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, dtype=torch.float16,
                                 enabled=(device.type == "cuda")):
-                _, loss = model(images, tgt_in, tgt_out)
+                context, cls_logits = model.encode(images, labels, args.label_teacher_prob)
+                _, loss = model(images, tgt_in, tgt_out, context=context)
+                total_loss = loss
+                if bce is not None:
+                    aux = bce(cls_logits.float(), labels)
+                    total_loss = loss + args.aux_weight * aux
+                    aux_loss.update(aux.item(), images.size(0))
 
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -204,9 +244,11 @@ def main():
             epoch_loss.update(loss.item(), images.size(0))
             it += 1
 
+        # Val loss always uses the head's own predictions - what the model gets at test time.
         val_loss = estimate_loss(model, val_loader, device, args.eval_batches or None)
         elapsed = format_seconds(time.time() - start)
-        print(f"\nepoch {epoch + 1}  train {epoch_loss.avg:.4f}  val {val_loss:.4f}  "
+        aux_str = f"  aux {aux_loss.avg:.4f}" if bce is not None else ""
+        print(f"\nepoch {epoch + 1}  train {epoch_loss.avg:.4f}{aux_str}  val {val_loss:.4f}  "
               f"lr {optimizer.param_groups[0]['lr']:.2e}  [{elapsed}]")
         sample_reports(model, val_loader, tokenizer, device)
 
@@ -222,6 +264,7 @@ def main():
                     "n_emb": args.n_emb, "n_head": args.n_head, "n_layer": args.n_layer,
                     "block_size": args.block_size, "dropout": args.dropout,
                     "factorized_pos": args.factorized_pos,
+                    "label_tokens": args.label_tokens,
                     "vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id,
                 },
                 "args": vars(args),

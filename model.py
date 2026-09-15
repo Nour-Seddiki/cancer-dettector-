@@ -146,20 +146,44 @@ class VisualBridge(nn.Module):
         return self.drop(self.ln(x))
 
 
+class LabelBridge(nn.Module):
+    """(B, 14) condition probabilities -> (B, 14, n_emb) extra decoder context.
+
+    Token c interpolates between learned "c present" and "c absent" embeddings by the
+    probability the CNN's classifier head gives c. Appended to the 49 image tokens, it hands
+    the decoder the classifier's verdict in a form it can cross-attend to directly. Without
+    it the decoder has to rediscover every finding from raw features, and on ~3k studies it
+    mostly does not: the stage (a) classifier reached AUROC ~0.9 on cardiomegaly and
+    effusion while the decoder, over the same features, almost never wrote either.
+    """
+
+    def __init__(self, num_conditions, n_emb=n_emb, dropout=dropout):
+        super().__init__()
+        self.present = nn.Parameter(torch.randn(num_conditions, n_emb) * 0.02)
+        self.absent = nn.Parameter(torch.randn(num_conditions, n_emb) * 0.02)
+        self.ln = nn.LayerNorm(n_emb)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, probs):
+        p = probs.unsqueeze(-1)
+        return self.drop(self.ln(p * self.present + (1 - p) * self.absent))
+
+
 class ReportGenerator(nn.Module):
-    """DenseNet121 -> VisualBridge -> Transformer decoder -> report tokens."""
+    """DenseNet121 -> VisualBridge (+ LabelBridge) -> Transformer decoder -> report tokens."""
 
     def __init__(self, vocab_size, pad_id=0, n_emb=n_emb, n_head=n_head, n_layer=n_layer,
                  block_size=block_size, dropout=dropout, pretrained_cnn=True,
-                 encoder=None, factorized_pos=False, aux_classifier=False):
+                 encoder=None, factorized_pos=False, label_tokens=False):
         super().__init__()
         self.vocab_size = vocab_size
         self.pad_id = pad_id
         self.block_size = block_size
-        self.aux_classifier = aux_classifier
 
         self.encoder = encoder if encoder is not None else DenseNet121Encoder(pretrained=pretrained_cnn)
         self.bridge = VisualBridge(n_emb=n_emb, dropout=dropout, factorized=factorized_pos)
+        self.label_bridge = (LabelBridge(self.encoder.classifier.out_features, n_emb, dropout)
+                             if label_tokens else None)
 
         self.tok_emb = nn.Embedding(vocab_size, n_emb, padding_idx=pad_id)
         self.pos_emb = nn.Embedding(block_size, n_emb)
@@ -171,7 +195,11 @@ class ReportGenerator(nn.Module):
         # ~0.8M free parameters that would otherwise only see a handful of updates each.
         self.lm_head.weight = self.tok_emb.weight
 
-        self.apply(self._init_weights)
+        # Everything except the encoder: `self.apply` would also hit the encoder's Linear
+        # classifier head and silently wipe the stage (a) weights it was warm-started with.
+        for name, module in self.named_children():
+            if name != "encoder":
+                module.apply(self._init_weights)
 
     @staticmethod
     def _init_weights(module):
@@ -184,9 +212,32 @@ class ReportGenerator(nn.Module):
 
     # -- forward -----------------------------------------------------------------------
 
+    def encode(self, images, teacher_labels=None, teacher_prob=0.0):
+        """Images -> ((B, 49 [+14], n_emb) cross-attention context, (B, 14) condition logits).
+
+        `teacher_labels` / `teacher_prob` are for training only: with probability
+        `teacher_prob` per study, the condition tokens are built from the ground-truth labels
+        instead of the head's predictions. Trained purely on its own noisy predictions, the
+        decoder learns to half-ignore the tokens and the normal-template prior still wins;
+        seeing the true labels part of the time makes them a signal it has to follow, and
+        the rest of the time keeps it used to the head's soft outputs it gets at test time.
+        """
+        feats = self.encoder.forward_features(images)            # (B, 49, 1024)
+        cls_logits = self.encoder.classifier(feats.mean(dim=1))  # same pooling as stage (a)
+        context = self.bridge(feats)
+        if self.label_bridge is not None:
+            # Detached: the tokens carry what the classifier head believes (trained only by
+            # the auxiliary BCE), not a free code the LM loss could repurpose.
+            probs = torch.sigmoid(cls_logits.float()).detach()
+            if teacher_labels is not None and teacher_prob > 0:
+                use = torch.rand(probs.shape[0], 1, device=probs.device) < teacher_prob
+                probs = torch.where(use, teacher_labels.float(), probs)
+            context = torch.cat([context, self.label_bridge(probs).to(context.dtype)], dim=1)
+        return context, cls_logits
+
     def encode_image(self, images):
-        """Images -> (B, 49, n_emb) cross-attention context."""
-        return self.bridge(self.encoder.forward_features(images))
+        """Images -> cross-attention context."""
+        return self.encode(images)[0]
 
     def decode(self, tgt_ids, context):
         B, T = tgt_ids.shape

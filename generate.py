@@ -41,7 +41,8 @@ def main():
     src.add_argument("--split", choices=["train", "val", "test"],
                      help="sample images from a manifest split instead")
     p.add_argument("--checkpoint", default="checkpoints/report_generator.pt")
-    p.add_argument("--beam-size", type=int, default=3, help="1 = greedy")
+    p.add_argument("--beam-size", type=int, default=1,
+                   help="1 = greedy (default: beam search drifts to the normal template)")
     p.add_argument("--length-penalty", type=float, default=0.6)
     p.add_argument("--max-new-tokens", type=int, default=120)
     p.add_argument("--limit", type=int, default=5, help="how many to sample with --split")
