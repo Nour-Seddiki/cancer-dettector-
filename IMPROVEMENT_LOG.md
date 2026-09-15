@@ -35,11 +35,15 @@ is in the README "v5" section.
 
 ## Queue (highest expected value first)
 
-1. **Auxiliary-loss weight sweep** (0.5, 2.0) on the v5a recipe.
+1. **Combine the two near-misses: head TTA (zoom 0.1) on v10a.** Each fell just short on
+   its own (TTA +0.014 on v5a, aux weight 0.5 +0.013), and they act on different parts:
+   TTA sharpens the head's probabilities, while the lighter aux loss lets the decoder write
+   more findings (recall 0.354 to 0.407). The TTA code has to be re-added (method in the
+   v6 note), then `rg_v10a_phase2.pt` is copied, re-tuned with `--tta-zoom 0.1` and
+   evaluated on val. Caveat: stacking val near-misses risks multiple comparisons, so if it
+   is accepted, the test evaluation is the check that the gain is real.
 2. **Seed ensemble of the head.** Average the probabilities of 2-3 phase-2 runs.
 3. **Decoder regularisation:** dropout 0.2, or 2 layers.
-4. **Retest head TTA on the next accepted model.** Zoom 0.1 was a near-miss on v5a (see
-   History); the method is described in the v6 note and is inference only.
 
 ## History
 
@@ -56,6 +60,7 @@ is in the README "v5" section.
 | v7 | warm-start from `classifier_v3` (trained on text labels), v5a recipe | 0.301 | - | rejected |
 | v8 | `classifier_v3` + text-label tokens + text-label aux BCE | 0.346 | - | rejected |
 | v9 | 320px input throughout (`classifier_v4` + v5a recipe, 100 image tokens) | 0.305 | - | rejected |
+| v10a / v10b | v5a recipe with aux weight 0.5 / 2.0 (was 1.0) | 0.365 / 0.258 | - | rejected, v10a near-miss |
 
 \* Scored before the labeller fix. Test numbers for v2 were re-scored with the fixed labeller.
 
@@ -66,7 +71,7 @@ probabilities, and the decoder's image tokens stayed on the original view. On va
 0.10 moved the head's own micro F1 from 0.391 to 0.411 and the reports from 0.352 to
 0.366 (precision 0.351 to 0.382, recall 0.354 to 0.351, macro 0.235 to 0.252). Zoom 0.15
 gave 0.363. The +0.014 gain is under the 0.015 bar, so it was rejected and reverted, even
-though both zooms agree. It is queued to retest on top of the next accepted model.
+though both zooms agree.
 
 **v7 (text-label classifier).** `classifier_v3` was trained exactly like `classifier_v2`
 (15 epochs), but on the rule-based labeller's reading of each report instead of the
@@ -98,3 +103,12 @@ at 320px, warm-started from it, gave a head with thresholded micro F1 0.404 on v
 micro P / R / F1 0.343 / 0.275 / 0.305 and macro 0.205, so the decoder passed through about
 75% of the head's F1. Pneumothorax and fracture stayed at zero even at 320px. At this data
 size, more pixels mainly give the decoder more tokens to attend over, not better findings.
+
+**v10 (aux weight).** This was a command-line change only, so there was no code to revert.
+The v5a recipe was re-run with `--aux-weight` 0.5 and 2.0. The heavier weight hurt badly:
+CE micro P / R / F1 0.416 / 0.187 / 0.258, macro 0.165. Pulled harder toward the manifest
+labels, the head made the decoder cautious. The lighter weight gave the best val result
+yet, CE micro P / R / F1 0.332 / 0.407 / 0.365 and macro 0.240. Recall went from 0.354 to
+0.407 at a small precision cost, and it wrote 33% distinct reports against v5a's 27%. The
+head's own micro F1 was 0.400. At +0.013 it is under the 0.015 bar, so it was rejected,
+and `rg_v10a_phase2.pt` is kept for the combination test in queue item 1.
