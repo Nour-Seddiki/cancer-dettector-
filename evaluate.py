@@ -41,9 +41,12 @@ def load_generator(checkpoint_path, device):
         label_tokens=cfg.get("label_tokens", False),
     ).to(device)
     model.load_state_dict(ckpt["model"])
+    if ckpt.get("label_thresholds") is not None:
+        model.label_thresholds = torch.tensor(ckpt["label_thresholds"], device=device)
     model.eval()
     print(f"loaded {checkpoint_path} (epoch {ckpt.get('epoch', '?')}, "
-          f"val loss {ckpt.get('val_loss', float('nan')):.4f}, vocab {len(tokenizer)})")
+          f"val loss {ckpt.get('val_loss', float('nan')):.4f}, vocab {len(tokenizer)}"
+          + (", binary condition tokens" if model.label_thresholds is not None else "") + ")")
     return model, tokenizer
 
 
@@ -96,7 +99,7 @@ def worst_examples(hypotheses, references, rows, k=5):
 
 def main():
     p = argparse.ArgumentParser(description="Evaluate the report generator.")
-    p.add_argument("--checkpoint", default=str(CKPT / "report_generator.pt"))
+    p.add_argument("--checkpoint", default=str(CKPT / "rg_v5a_phase2.pt"))
     p.add_argument("--split", default="test", choices=["train", "val", "test"])
     p.add_argument("--batch-size", type=int, default=16)
     # Greedy by default: beam search drifts to the highest-likelihood report, which here is

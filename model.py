@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from cnn_model import FEATURE_DIM, NUM_REGIONS, DenseNet121Encoder
+from labels import NO_FINDING_IDX
 
 # Decoder hyperparameters. Smaller than the translation model on purpose: the vocab is
 # ~1.5k tokens instead of ~100k, and IU X-Ray has ~3k training studies, so a 6-layer/384-dim
@@ -172,6 +173,10 @@ class LabelBridge(nn.Module):
 class ReportGenerator(nn.Module):
     """DenseNet121 -> VisualBridge (+ LabelBridge) -> Transformer decoder -> report tokens."""
 
+    # (14,) per-condition thresholds, set by evaluate.load_generator when the checkpoint
+    # carries tuned ones (tune_thresholds.py). None = soft probability condition tokens.
+    label_thresholds = None
+
     def __init__(self, vocab_size, pad_id=0, n_emb=n_emb, n_head=n_head, n_layer=n_layer,
                  block_size=block_size, dropout=dropout, pretrained_cnn=True,
                  encoder=None, factorized_pos=False, label_tokens=False):
@@ -232,6 +237,19 @@ class ReportGenerator(nn.Module):
             if teacher_labels is not None and teacher_prob > 0:
                 use = torch.rand(probs.shape[0], 1, device=probs.device) < teacher_prob
                 probs = torch.where(use, teacher_labels.float(), probs)
+            elif self.label_thresholds is not None:
+                # Binary tokens at per-condition thresholds tuned on val (tune_thresholds.py).
+                # A decoder trained on ground-truth 0/1 tokens follows a confident 0/1 far
+                # more reliably than a soft probability it never saw during training.
+                thr = self.label_thresholds
+                probs = (probs >= thr).float()
+                if torch.isnan(thr[NO_FINDING_IDX]):
+                    # NaN = derive "No Finding" (tune_thresholds.py --no-finding derived): it
+                    # means "no abnormal condition" in every ground-truth label the decoder
+                    # saw, so set it from the abnormal tokens instead of thresholding it alone.
+                    abnormal = torch.cat([probs[:, :NO_FINDING_IDX],
+                                          probs[:, NO_FINDING_IDX + 1:]], dim=1)
+                    probs[:, NO_FINDING_IDX] = 1.0 - abnormal.amax(dim=1)
             context = torch.cat([context, self.label_bridge(probs).to(context.dtype)], dim=1)
         return context, cls_logits
 

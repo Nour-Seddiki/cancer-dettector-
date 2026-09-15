@@ -19,9 +19,10 @@ Debug first, then scale (plan weeks 4-5):
         --unfreeze-cnn --lr 1e-4 --cnn-lr 1e-5
 
 `--label-tokens` feeds the CNN classifier head's 14 condition probabilities to the decoder
-as extra context tokens, `--label-teacher-prob` swaps in the ground-truth labels for that
-fraction of training studies, and `--aux-weight` adds the plan's Section 4 auxiliary BCE
-loss on the head, which keeps its probabilities (and the features under them) grounded.
+as extra context tokens, `--label-teacher-prob` swaps in ground-truth labels (from the
+manifest, or read off the report text with `--teacher-source text`) for that fraction of
+training studies, and `--aux-weight` adds the plan's Section 4 auxiliary BCE loss on the
+head, which keeps its probabilities (and the features under them) grounded.
 """
 
 import argparse
@@ -104,9 +105,9 @@ def build_model(args, tokenizer, device):
     else:
         print("  CNN: fully frozen (phase 1)")
     if args.label_tokens:
-        print("  decoder context: 49 image tokens + 14 condition tokens"
-              + (f" (ground-truth labels for {args.label_teacher_prob:.0%} of training studies)"
-                 if args.label_teacher_prob > 0 else ""))
+        teacher = (f" ({args.teacher_source} labels for {args.label_teacher_prob:.0%} of "
+                   f"training studies)" if args.label_teacher_prob > 0 else "")
+        print(f"  decoder context: 49 image tokens + 14 condition tokens{teacher}")
     return model
 
 
@@ -135,8 +136,11 @@ def main():
                    help="append the classifier head's 14 condition probabilities to the "
                         "decoder context as extra tokens")
     p.add_argument("--label-teacher-prob", type=float, default=0.0,
-                   help="fraction of training studies whose condition tokens use the "
+                   help="fraction of training studies whose condition tokens use "
                         "ground-truth labels instead of the head's predictions")
+    p.add_argument("--teacher-source", choices=["manifest", "text"], default="manifest",
+                   help="ground-truth labels for the condition tokens: the manifest's "
+                        "(MeSH-first), or the rule-based labeller run on the report itself")
     # optimisation
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -194,6 +198,7 @@ def main():
         pos_weight, _ = pos_weight_from_rows(train_loader.dataset.rows)
         bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
         print(f"  auxiliary BCE on the classifier head, weight {args.aux_weight:g}")
+    teacher_row = 1 if args.teacher_source == "text" else 0
 
     optimizer = torch.optim.AdamW(
         model.param_groups(args.lr, args.cnn_lr), weight_decay=args.weight_decay)
@@ -226,11 +231,12 @@ def main():
 
             with torch.autocast(device_type=device.type, dtype=torch.float16,
                                 enabled=(device.type == "cuda")):
-                context, cls_logits = model.encode(images, labels, args.label_teacher_prob)
+                context, cls_logits = model.encode(images, labels[:, teacher_row],
+                                                   args.label_teacher_prob)
                 _, loss = model(images, tgt_in, tgt_out, context=context)
                 total_loss = loss
                 if bce is not None:
-                    aux = bce(cls_logits.float(), labels)
+                    aux = bce(cls_logits.float(), labels[:, 0])
                     total_loss = loss + args.aux_weight * aux
                     aux_loss.update(aux.item(), images.size(0))
 

@@ -21,7 +21,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 
-from labels import CONDITIONS
+from labels import CONDITIONS, labels_from_text
 
 IGNORE_INDEX = -100
 IMAGE_SIZE = 224
@@ -277,17 +277,20 @@ class CXRClassificationDataset(_BaseCXRDataset):
 
 class CXRReportDataset(_BaseCXRDataset):
     """Stage (c): image -> report token ids (variable length, padded by the collator), plus
-    the study's 14-way label vector for the auxiliary classification loss."""
+    a (2, 14) label tensor. Row 0 is the study's manifest labels (MeSH-first; the auxiliary
+    classification target). Row 1 is what the rule-based labeller reads off this report's
+    own text - the same labeller the clinical-efficacy metric scores generations with."""
 
     def __init__(self, rows, tokenizer, train, max_len=160, data_root=DATA, clahe=False):
         super().__init__(rows, train=train, data_root=data_root, clahe=clahe)
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.text_labels = [labels_from_text(r["report"]) for r in rows]
 
     def __getitem__(self, i):
         row = self.rows[i]
         ids = self.tokenizer.encode(row["report"])[: self.max_len + 1]
-        labels = torch.tensor(label_vector(row), dtype=torch.float32)
+        labels = torch.tensor([label_vector(row), self.text_labels[i]], dtype=torch.float32)
         return self._image(row), torch.tensor(ids, dtype=torch.long), labels
 
 

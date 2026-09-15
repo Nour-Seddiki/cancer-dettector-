@@ -239,6 +239,65 @@ effusion well, yet the decoder rarely writes them. The bottleneck has therefore 
 the image features to the decoder's normal-template prior. Next steps are the auxiliary BCE
 loss from the plan and conditioning the decoder on the classifier's predictions.
 
+### v5: condition tokens from the classifier head
+
+The decoder now cross-attends over 63 tokens: the 49 image regions plus 14 condition
+tokens (`--label-tokens`, `model.LabelBridge`). Each condition token interpolates between
+learned "present" and "absent" embeddings according to the CNN classifier head's output,
+and the head keeps training through the plan's auxiliary BCE loss (`--aux-weight`).
+
+The steps that mattered, measured on val (clinical-efficacy micro F1 over the 13 abnormal
+conditions):
+
+- **Greedy decoding instead of beam 3:** 0.062 → 0.201 on the v2 model, with no
+  retraining. Beam search converges on the highest-likelihood report, which here is the
+  normal template. Greedy is now the default in `evaluate.py`, `generate.py` and `demo.py`.
+- **Soft tokens from the head's own predictions (v3): 0.212.** Diagnostic: giving v3 the
+  ground-truth labels as tokens changes nothing (0.196). Trained only on its own noisy
+  predictions, it had learned to ignore the tokens.
+- **Ground-truth tokens during training (`--label-teacher-prob`):** with half of the
+  training studies on ground truth (v4), feeding the true labels at eval reaches 0.400, so
+  the decoder now follows the tokens. With all of them on ground truth (v5a), plus binary
+  tokens at inference, it reaches **0.340**.
+- **Binary tokens at thresholds tuned on val (`tune_thresholds.py`), chosen jointly to
+  maximise micro F1.** Tuning each condition's F1 on its own set Pneumonia to a threshold
+  that flagged 34% of studies at 4% precision, which put the finding into every one of
+  those reports. "No Finding" is derived from the abnormal tokens (it means "none of them"
+  in every ground-truth label); on v4 that scored 0.314 against 0.289 for thresholding it.
+- Taking the teacher labels from the report text instead of the manifest (v5b) did not
+  help (0.301).
+
+```bash
+python training.py --epochs 30 --abnormal-weight 3 --label-tokens --aux-weight 1 \
+    --label-teacher-prob 1 --cnn-checkpoint checkpoints/classifier_v2.pt \
+    --out checkpoints/rg_v5a_phase1.pt
+python training.py --epochs 15 --abnormal-weight 3 --label-tokens --aux-weight 1 \
+    --label-teacher-prob 1 --resume checkpoints/rg_v5a_phase1.pt --unfreeze-cnn \
+    --lr 1e-4 --cnn-lr 1e-5 --out checkpoints/rg_v5a_phase2.pt
+python tune_thresholds.py --checkpoint checkpoints/rg_v5a_phase2.pt   # val
+python evaluate.py --checkpoint checkpoints/rg_v5a_phase2.pt --split test
+```
+
+Test split (332 studies, rule-based CE labeller, thresholds tuned on val and the test split
+scored once):
+
+| | v2, beam 3 (previous) | v2, greedy | **v5a** |
+|---|---|---|---|
+| CE micro P / R / F1 | 0.636 / 0.026 / 0.051 | 0.465 / 0.125 / 0.196 | 0.333 / 0.302 / **0.317** |
+| CE macro F1 | 0.029 | 0.104 | 0.171 |
+| distinct reports | 9.3% | 17.2% | 26.8% |
+| BLEU-1 / BLEU-4 | 0.212 / 0.060 | 0.191 / 0.061 | 0.241 / 0.070 |
+| ROUGE-L / CIDEr | 0.237 / 0.258 | 0.261 / 0.359 | 0.256 / 0.309 |
+
+Recall on abnormal findings went from 2.6% to 30%. By condition, v5a scores F1 of 0.43
+on cardiomegaly, 0.43 on lung opacity, 0.44 on atelectasis and 0.36 on pleural effusion.
+The classifier head is now the ceiling: its own thresholded micro F1 on val is 0.39 and
+the reports reach 0.34. It still misses almost all lung lesions (F1 0.06), pneumothorax,
+pneumonia and fractures, writes some findings into normal studies, and occasionally
+repeats itself (1.2% repeated 4-grams). The next levers are a stronger classifier (higher
+input resolution, test-time augmentation) and scoring with CheXbert instead of the
+rule-based labeller.
+
 ## References
 
 - IU X-Ray / Open-i — <https://openi.nlm.nih.gov/>

@@ -75,7 +75,7 @@ def wrap(text, width=78, limit=330):
 
 def main():
     p = argparse.ArgumentParser(description="Report generation + classifier demo on test X-rays.")
-    p.add_argument("--checkpoint", default=str(CKPT / "rg_v2_phase2.pt"))
+    p.add_argument("--checkpoint", default=str(CKPT / "rg_v5a_phase2.pt"))
     p.add_argument("--classifier", default=str(CKPT / "classifier_v2.pt"))
     p.add_argument("--split", default="test", choices=["train", "val", "test"])
     p.add_argument("--conditions", nargs="+", default=DEFAULT_CONDITIONS, choices=CONDITIONS,
