@@ -30,16 +30,15 @@ is in the README "v5" section.
 
 ## Queue (highest expected value first)
 
-1. **Test-time augmentation for the classifier head.** Average its probabilities over a few
-   crops or scales (no horizontal flip, because anatomy is left-right dependent), then
-   re-tune the thresholds. Inference only, no retraining.
-2. **Stronger stage (a) classifier.** Retrain `classifier_v3` on the text-derived labels
-   (what CE measures) and/or for longer, then warm-start v6 from it.
-3. **Higher input resolution.** For example 320px, which gives a 10x10 grid of 100 image
+1. **Stronger stage (a) classifier.** Retrain `classifier_v3` on the text-derived labels
+   (what CE measures) and/or for longer, then warm-start v7 from it.
+2. **Higher input resolution.** For example 320px, which gives a 10x10 grid of 100 image
    tokens. This needs `GRID` and `NUM_REGIONS` to follow the input size.
-4. **Auxiliary-loss weight sweep** (0.5, 2.0) on the v5a recipe.
-5. **Seed ensemble of the head.** Average the probabilities of 2-3 phase-2 runs.
-6. **Decoder regularisation:** dropout 0.2, or 2 layers.
+3. **Auxiliary-loss weight sweep** (0.5, 2.0) on the v5a recipe.
+4. **Seed ensemble of the head.** Average the probabilities of 2-3 phase-2 runs.
+5. **Decoder regularisation:** dropout 0.2, or 2 layers.
+6. **Retest head TTA on the next accepted model.** Zoom 0.1 was a near-miss on v5a (see
+   History); the code is in the v6 entry's description and is inference only.
 
 ## History
 
@@ -52,5 +51,15 @@ is in the README "v5" section.
 | v5a | ground-truth tokens for 100% of studies | 0.340* | 0.317* | accepted |
 | v5b | teacher labels read off the report text | 0.301* | - | rejected |
 | v5a | fixed cardiomegaly labeller + `no_repeat_ngram=3` | 0.352 | 0.323 | accepted |
+| v6a / v6b | head TTA at inference, zoom 0.10 / 0.15 | 0.366 / 0.363 | - | rejected, near-miss |
 
 \* Scored before the labeller fix. Test numbers for v2 were re-scored with the fixed labeller.
+
+**v6 (head TTA).** At inference, the classifier head's probabilities were averaged over
+the original view plus 5 crops (centre and four corners) of a copy upscaled by the zoom
+factor, with no horizontal flip. Thresholds were then re-tuned on the averaged
+probabilities, and the decoder's image tokens stayed on the original view. On val, zoom
+0.10 moved the head's own micro F1 from 0.391 to 0.411 and the reports from 0.352 to
+0.366 (precision 0.351 to 0.382, recall 0.354 to 0.351, macro 0.235 to 0.252). Zoom 0.15
+gave 0.363. The +0.014 gain is under the 0.015 bar, so it was rejected and reverted, even
+though both zooms agree. It is queued to retest on top of the next accepted model.
