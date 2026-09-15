@@ -30,15 +30,18 @@ is in the README "v5" section.
 
 ## Queue (highest expected value first)
 
-1. **Stronger stage (a) classifier.** Retrain `classifier_v3` on the text-derived labels
-   (what CE measures) and/or for longer, then warm-start v7 from it.
+1. **Match the decoder's token semantics to a text-label head.** Warm-start from
+   `classifier_v3.pt` (already trained, on disk) and train with `--teacher-source text`,
+   with the auxiliary BCE also on the text labels (needs an `--aux-source text` option in
+   `training.py`). v7 showed the v3 head is better (0.422 against 0.391) but the decoder,
+   taught on manifest-label tokens, passed less of it through.
 2. **Higher input resolution.** For example 320px, which gives a 10x10 grid of 100 image
    tokens. This needs `GRID` and `NUM_REGIONS` to follow the input size.
 3. **Auxiliary-loss weight sweep** (0.5, 2.0) on the v5a recipe.
 4. **Seed ensemble of the head.** Average the probabilities of 2-3 phase-2 runs.
 5. **Decoder regularisation:** dropout 0.2, or 2 layers.
 6. **Retest head TTA on the next accepted model.** Zoom 0.1 was a near-miss on v5a (see
-   History); the code is in the v6 entry's description and is inference only.
+   History); the method is described in the v6 note and is inference only.
 
 ## History
 
@@ -52,6 +55,7 @@ is in the README "v5" section.
 | v5b | teacher labels read off the report text | 0.301* | - | rejected |
 | v5a | fixed cardiomegaly labeller + `no_repeat_ngram=3` | 0.352 | 0.323 | accepted |
 | v6a / v6b | head TTA at inference, zoom 0.10 / 0.15 | 0.366 / 0.363 | - | rejected, near-miss |
+| v7 | warm-start from `classifier_v3` (trained on text labels), v5a recipe | 0.301 | - | rejected |
 
 \* Scored before the labeller fix. Test numbers for v2 were re-scored with the fixed labeller.
 
@@ -63,3 +67,15 @@ probabilities, and the decoder's image tokens stayed on the original view. On va
 0.366 (precision 0.351 to 0.382, recall 0.354 to 0.351, macro 0.235 to 0.252). Zoom 0.15
 gave 0.363. The +0.014 gain is under the 0.015 bar, so it was rejected and reverted, even
 though both zooms agree. It is queued to retest on top of the next accepted model.
+
+**v7 (text-label classifier).** `classifier_v3` was trained exactly like `classifier_v2`
+(15 epochs), but on the rule-based labeller's reading of each report instead of the
+manifest's MeSH-first labels, via a `--label-source text` option in `train_classifier.py`
+(reverted, while `classifier_v3.pt` is kept). Its best val mean AUROC was 0.714, against
+text labels. Warm-started from it, the v5a recipe gave a better head, with thresholded
+micro F1 on val of 0.422 (was 0.391; cardiomegaly 0.575, lung opacity 0.473, atelectasis
+0.480). The reports were worse, though: CE micro P / R / F1 0.416 / 0.236 / 0.301 and macro
+0.188. The decoder passed through 71% of the head's F1, where v5a passed about 90%. The
+likely cause is that the decoder was taught with manifest-label tokens while the head now
+predicts text labels, and the aux BCE on manifest labels pulls the head back. Queue item 1
+tests matching them.
