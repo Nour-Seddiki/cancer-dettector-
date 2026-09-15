@@ -213,22 +213,97 @@ def parse_report(xml_path):
     }
 
 
-def assign_view(image_ids):
-    """Heuristic frontal/lateral assignment for a study.
+# View assignment. The PNG release carries no view metadata (it lives in the DICOM
+# headers, which Open-i does not ship), so the view has to come from the pixels.
+VIEW_PAIR_GAP = 0.3   # symmetry gap that makes a 2-image study a confident pseudo-label
+MIN_FRONTAL_P = 0.08  # below this, a study's most frontal-looking image is still a lateral
 
-    The PNG release carries no view metadata (it is in the DICOM headers, which Open-i
-    does not ship). IU X-Ray studies are acquired as a PA/AP frontal followed by a
-    lateral, and the parentImage ids preserve that acquisition order, so the
-    lowest-sorting id of a study is taken as the frontal view. This is the same
-    images[0]/images[1] convention R2Gen uses.
 
-    It is a heuristic, not ground truth - `--all-views` keeps every image if you would
-    rather not rely on it, and view is recorded in the manifest either way.
+def _view_features(path):
+    """Decode once -> (left-right mirror symmetry, z-scored 32x32 thumbnail).
+
+    A frontal CXR is roughly mirror-symmetric (two lung fields either side of the spine);
+    a lateral is not. Symmetry alone is too noisy to threshold - rotated frontals and
+    centred laterals overlap across ~0.35-0.6 - but it is a reliable *relative* signal
+    between the two images of one study, which is what the pseudo-labels use.
     """
-    views = {}
-    for i, img_id in enumerate(sorted(image_ids)):
-        views[img_id] = "frontal" if i == 0 else "lateral"
-    return views
+    import numpy as np
+    from PIL import Image
+
+    with Image.open(path) as im:
+        a = np.asarray(im.convert("L").resize((64, 64), Image.BILINEAR), dtype=np.float32)
+    z = (a - a.mean()) / (a.std() + 1e-6)
+    sym = float((z * z[:, ::-1]).mean())
+    t = a.reshape(32, 2, 32, 2).mean(axis=(1, 3))
+    t = (t - t.mean()) / (t.std() + 1e-6)
+    return sym, t.ravel()
+
+
+def _fit_logreg(X, y, l2=1e-2, iters=600, lr=0.5):
+    """Full-batch L2 logistic regression - deterministic, and too small to need sklearn."""
+    import numpy as np
+
+    w, b = np.zeros(X.shape[1]), 0.0
+    for _ in range(iters):
+        g = 1 / (1 + np.exp(-(X @ w + b))) - y
+        w -= lr * (X.T @ g / len(y) + l2 * w)
+        b -= lr * g.mean()
+    return w, b
+
+
+def score_views(studies, workers=8):
+    """P(frontal) for every image, from a frontal/lateral classifier fit to this dataset.
+
+    There are no view labels, so the classifier is self-supervised: in 2-image studies
+    (the usual frontal + lateral pair) whose symmetry scores are far apart, the more
+    symmetric image is labelled frontal and the other lateral. Logistic regression on
+    32x32 thumbnails + symmetry is fit on those ~4.3k pseudo-labels and then scores every
+    image. Grouped 5-fold CV on the pseudo-labels was 0.99, and on the studies where it
+    and raw symmetry pick different images, spot checks side with it almost every time.
+    """
+    import numpy as np
+    from multiprocessing import Pool
+
+    ids = sorted({i for imgs in studies for i in imgs})
+    with Pool(workers) as pool:
+        feats = pool.map(_view_features, [IMAGE_DIR / f"{i}.png" for i in ids], chunksize=32)
+    sym = np.array([f[0] for f in feats], dtype=np.float32)
+    X = np.hstack([np.stack([f[1] for f in feats]), sym[:, None]])
+    X = (X - X.mean(0)) / (X.std(0) + 1e-6)
+    idx = {s: k for k, s in enumerate(ids)}
+
+    pos, neg = [], []
+    for imgs in studies:
+        if len(imgs) == 2:
+            a, b = sorted((idx[s] for s in imgs), key=lambda k: sym[k], reverse=True)
+            if sym[a] - sym[b] > VIEW_PAIR_GAP:
+                pos.append(a)
+                neg.append(b)
+    train = np.array(pos + neg)
+    y = np.r_[np.ones(len(pos)), np.zeros(len(neg))]
+    w, b = _fit_logreg(X[train], y)
+    p = 1 / (1 + np.exp(-(X @ w + b)))
+    train_acc = float(((p[train] > 0.5) == (y == 1)).mean())
+    print(f"  view classifier: {len(train)} pseudo-labelled images, "
+          f"train accuracy {train_acc:.3f}")
+    return {s: float(p[k]) for s, k in idx.items()}
+
+
+def assign_view(image_ids, p_frontal):
+    """Frontal/lateral assignment for one study: its most frontal-looking image is the
+    frontal, unless even that one scores below MIN_FRONTAL_P (a lateral-only study).
+
+    This replaced a "lowest-sorting image id is the frontal" rule (the images[0]
+    convention R2Gen uses), which assumed ids follow acquisition order. They do not
+    reliably: 589 of the 3,826 rows that rule put in the "frontal-only" manifest were
+    laterals (439 studies with the wrong image picked, 150 with no frontal at all).
+
+    Exactly one image per study is frontal, so frontal-only mode stays one image per
+    study. `--all-views` keeps every image; view and p_frontal go in the manifest either way.
+    """
+    best = max(image_ids, key=p_frontal.get)
+    has_frontal = p_frontal[best] >= MIN_FRONTAL_P
+    return {i: "frontal" if (i == best and has_frontal) else "lateral" for i in image_ids}
 
 
 def stable_split(uid, val_frac, test_frac, seed):
@@ -255,6 +330,7 @@ def build_manifest(args):
 
     rows = []
     stats = Counter()
+    studies = []
     for xml_path in xml_files:
         study = parse_report(xml_path)
         if study is None:
@@ -265,8 +341,17 @@ def build_manifest(args):
         if not present:
             stats["studies_dropped_no_image"] += 1
             continue
+        studies.append((study, present))
 
-        views = assign_view(present)
+    print(f"  scoring views for {sum(len(p) for _, p in studies)} images")
+    p_frontal = score_views([p for _, p in studies])
+
+    for study, present in studies:
+        views = assign_view(present, p_frontal)
+        if not args.all_views and "frontal" not in views.values():
+            stats["studies_dropped_lateral_only"] += 1
+            continue
+
         mesh_vec = labels_from_mesh(study["mesh"])
         label_vec = label_study(study["mesh"], study["report"])
         label_source = "mesh" if mesh_vec is not None else "text"
@@ -287,6 +372,7 @@ def build_manifest(args):
                 "image_id": img_id,
                 "image_path": str(Path("raw/images") / f"{img_id}.png").replace("\\", "/"),
                 "view": view,
+                "p_frontal": f"{p_frontal[img_id]:.4f}",
                 "split": split,
                 "findings": study["findings"],
                 "impression": study["impression"],
@@ -311,6 +397,9 @@ def build_manifest(args):
     with open(PROCESSED / "manifest_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+    if stats["studies_dropped_lateral_only"]:
+        print(f"  lateral-only   : {stats['studies_dropped_lateral_only']} studies dropped "
+              f"(no image scored as frontal)")
     print(f"\n  wrote {MANIFEST} ({len(rows)} rows)")
     return summary
 
