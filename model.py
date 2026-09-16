@@ -170,12 +170,30 @@ class LabelBridge(nn.Module):
         return self.drop(self.ln(p * self.present + (1 - p) * self.absent))
 
 
+def tta_crops(images, zoom):
+    """The extra views of a head TTA pass: centre and four corners of a zoomed-in copy.
+
+    Upscaling by `zoom` and cropping back to the original size shows the head the same
+    anatomy slightly larger and with the field of view shifted. That is the only
+    augmentation that makes sense here: no horizontal flip, because the cardiac silhouette
+    and organ situs are laterality-dependent (see `dataloader.build_transform`).
+    """
+    H, W = images.shape[-2:]
+    big = F.interpolate(images, scale_factor=1.0 + zoom, mode="bilinear", align_corners=False)
+    dh, dw = big.shape[-2] - H, big.shape[-1] - W
+    offsets = [(dh // 2, dw // 2), (0, 0), (0, dw), (dh, 0), (dh, dw)]
+    return [big[:, :, t:t + H, l:l + W] for t, l in offsets]
+
+
 class ReportGenerator(nn.Module):
     """DenseNet121 -> VisualBridge (+ LabelBridge) -> Transformer decoder -> report tokens."""
 
     # (14,) per-condition thresholds, set by evaluate.load_generator when the checkpoint
     # carries tuned ones (tune_thresholds.py). None = soft probability condition tokens.
     label_thresholds = None
+    # Head test-time augmentation zoom, restored from the checkpoint alongside the
+    # thresholds because the two belong together (see `condition_probs`). 0 = off.
+    tta_zoom = 0.0
 
     def __init__(self, vocab_size, pad_id=0, n_emb=n_emb, n_head=n_head, n_layer=n_layer,
                  block_size=block_size, dropout=dropout, pretrained_cnn=True,
@@ -217,6 +235,40 @@ class ReportGenerator(nn.Module):
 
     # -- forward -----------------------------------------------------------------------
 
+    def condition_probs(self, images, cls_logits):
+        """(B, 14) head probabilities for the condition tokens, TTA-averaged if enabled.
+
+        Averaging the head over the original view and the `tta_crops` views sharpens the
+        exact part of the pipeline the reports are bottlenecked on: generated findings
+        track the head's own thresholded F1 closely, so a better-calibrated head shows up
+        directly in them. The decoder's 49 image tokens stay on the original view - the
+        crops are a vote on *what* is there, not a different picture to describe.
+
+        Training-time is always the plain single-view path: the tokens have to stay the
+        thing the aux BCE is grounding, and TTA would only add cost per step.
+        """
+        probs = torch.sigmoid(cls_logits.float()).detach()
+        if not self.tta_zoom or self.training:
+            return probs
+        with torch.no_grad():
+            views = tta_crops(images, self.tta_zoom)
+            total = probs
+            for view in views:
+                feats = self.encoder.forward_features(view)
+                total = total + torch.sigmoid(
+                    self.encoder.classifier(feats.mean(dim=1)).float())
+        return total / (1 + len(views))
+
+    @torch.no_grad()
+    def head_probabilities(self, images):
+        """Condition probabilities exactly as the label tokens see them, pre-thresholding.
+
+        `tune_thresholds.py` picks thresholds on these, so it has to go through the same
+        path (TTA included) that `encode` will use at generation time.
+        """
+        feats = self.encoder.forward_features(images)
+        return self.condition_probs(images, self.encoder.classifier(feats.mean(dim=1)))
+
     def encode(self, images, teacher_labels=None, teacher_prob=0.0):
         """Images -> ((B, 49 [+14], n_emb) cross-attention context, (B, 14) condition logits).
 
@@ -233,7 +285,7 @@ class ReportGenerator(nn.Module):
         if self.label_bridge is not None:
             # Detached: the tokens carry what the classifier head believes (trained only by
             # the auxiliary BCE), not a free code the LM loss could repurpose.
-            probs = torch.sigmoid(cls_logits.float()).detach()
+            probs = self.condition_probs(images, cls_logits)
             if teacher_labels is not None and teacher_prob > 0:
                 use = torch.rand(probs.shape[0], 1, device=probs.device) < teacher_prob
                 probs = torch.where(use, teacher_labels.float(), probs)

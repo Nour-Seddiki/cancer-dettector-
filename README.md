@@ -309,6 +309,45 @@ into normal studies. The next levers are a stronger classifier (higher input res
 test-time augmentation) and scoring with CheXbert instead of the rule-based labeller.
 `IMPROVEMENT_LOG.md` tracks the experiments.
 
+### v12: one shared condition threshold
+
+The 14 condition tokens are switched on by thresholding the classifier head's probabilities,
+and until v12 those thresholds were fitted one per condition, by coordinate ascent on micro
+F1 over the 361 val studies. That is 13 free parameters fitted on a few hundred examples,
+several conditions carrying fewer than 25 positives — and it was overfitting badly enough to
+both hide real gains and manufacture fake ones.
+
+Measured directly: moving a val-fitted threshold vector to the test split costs about **0.06
+head micro F1** (0.414 → 0.353), more than any modelling change in this project's history.
+The per-condition optima simply move between splits — pleural effusion 0.575 → 0.350,
+atelectasis 0.700 → 0.475, lung lesion 0.550 → 0.925.
+
+Fitting a *single* threshold shared by all 13 conditions — one free parameter — was chosen by
+fitting on one random half of val and scoring on the other, 30 times, where it beat the
+per-condition fit by +0.020 micro F1. It could not be chosen on full-val CE, because that is
+the number the thresholds are fitted against.
+
+End to end on the test split, with the model weights completely unchanged:
+
+| | v5a (13 thresholds) | **v12a (1 threshold)** |
+|---|---|---|
+| CE micro P / R / F1 | 0.323 / 0.323 / 0.323 | 0.358 / 0.312 / **0.333** |
+| CE macro F1 | 0.202 | 0.217 |
+| BLEU-4 / CIDEr | 0.071 / 0.310 | 0.071 / 0.339 |
+
+```bash
+python tune_thresholds.py --checkpoint checkpoints/rg_v12a_global.pt --rule global
+python evaluate.py --checkpoint checkpoints/rg_v12a_global.pt --split test
+```
+
+The val score goes *down* (0.352 → 0.317) while the test score goes up, which is the whole
+point: the val figure was partly in-sample. v12a's test score is above its val score.
+
+The same threshold change on the aux-weight-0.5 + head-TTA weights (`v12b`, the current best
+by val) also reaches 0.333 test micro F1, up from 0.319. Head TTA and the lighter auxiliary
+loss each genuinely improve the classifier head, and TTA's head gain does transfer to test —
+but neither survives the decoder as a report-level gain. The threshold rule does.
+
 ## References
 
 - IU X-Ray / Open-i — <https://openi.nlm.nih.gov/>

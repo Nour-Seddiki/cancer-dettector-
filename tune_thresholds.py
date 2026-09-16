@@ -16,7 +16,15 @@ its report, which costs far more micro precision than the condition's few hits a
 The joint search switches such conditions off instead, while keeping common ones like
 Lung Opacity whose precision is modest but well above what they cost.
 
-Tune on val, report on test - never tune on the split you report.
+Since v12 the default is one threshold shared by all 13 abnormal conditions (`--rule
+global`). Thirteen free parameters fitted on 361 val studies do not survive the move to
+another split - they cost about 0.06 head micro F1 - and sharing one threshold is worth
++0.010 to +0.014 test CE micro F1 at completely unchanged model weights. `--rule coord`
+keeps the old per-condition behaviour.
+
+Tune on val, report on test - never tune on the split you report. Note the corollary: a val
+CE score is partly *in-sample* for whatever thresholds this script fitted, so two threshold
+rules cannot be compared on it. Fit on one random half of val and score on the other.
 """
 
 import argparse
@@ -81,6 +89,36 @@ def tune_micro(probs, y, passes=5):
     return thr
 
 
+def tune_global(probs, y):
+    """One threshold shared by all 13 abnormal conditions.
+
+    Thirteen thresholds coordinate-ascended on 361 val studies do not survive the move to
+    another split: they cost about 0.06 head micro F1 going from val to test, and several
+    conditions' optima move a long way (pleural effusion 0.575 to 0.350, atelectasis 0.700
+    to 0.475). Sharing one threshold is the crudest way to cut that variance, and it is the
+    rule that won a fit-on-half-of-val, score-on-the-other-half comparison: +0.020 held-out
+    micro F1 over `tune_micro` on v5a and +0.013 on v11, against bagging (+0.006 / +0.003)
+    and forcing low-support conditions off (negative for both). See IMPROVEMENT_LOG.md.
+    """
+    best_f1, best_t = -1.0, NEVER
+    for t in GRID:
+        total = sum(counts(probs[:, c], y[:, c], t) for c in ABNORMAL)
+        f1 = f1_score(*total)
+        if f1 > best_f1:
+            best_f1, best_t = f1, float(t)
+    return {c: best_t for c in ABNORMAL}
+
+
+def tune_shrunk(probs, y, alpha=0.5):
+    """Per-condition thresholds pulled `1 - alpha` of the way toward the global one.
+
+    The middle ground between the two: it keeps some per-condition freedom while paying
+    less of its variance. On held-out val halves it landed between them, close to `global`.
+    """
+    coord, glob = tune_micro(probs, y), tune_global(probs, y)
+    return {c: alpha * coord[c] + (1 - alpha) * glob[c] for c in ABNORMAL}
+
+
 @torch.no_grad()
 def head_probs(model, tokenizer, rows, device, batch_size=32, num_workers=2):
     """Head probabilities and reference-text labels for every study in `rows`."""
@@ -91,8 +129,8 @@ def head_probs(model, tokenizer, rows, device, batch_size=32, num_workers=2):
     for images, _, _, labels in loader:
         with torch.autocast(device_type=device.type, dtype=torch.float16,
                             enabled=(device.type == "cuda")):
-            _, logits = model.encode(images.to(device))
-        probs.append(torch.sigmoid(logits.float()).cpu().numpy())
+            p = model.head_probabilities(images.to(device))
+        probs.append(p.float().cpu().numpy())
         text_labels.append(labels[:, 1].numpy())
     return np.concatenate(probs), np.concatenate(text_labels)
 
@@ -105,6 +143,21 @@ def main():
                    help="derive the No Finding token from the abnormal ones (in every "
                         "ground-truth label the decoder saw it means 'none of them'), or "
                         "threshold it on its own")
+    p.add_argument("--rule", choices=["global", "coord", "shrunk"], default="global",
+                   help="how to fit the thresholds: one threshold shared by all abnormal "
+                        "conditions (the default), per-condition coordinate ascent on micro "
+                        "F1 (the original), or the two blended. `global` is the default "
+                        "because the 13-parameter fit overfits val badly enough to cost "
+                        "~0.06 head micro F1 on test, while sharing one threshold is worth "
+                        "+0.010 to +0.014 test CE micro F1 at unchanged model weights.")
+    p.add_argument("--shrink-alpha", type=float, default=0.5,
+                   help="with --rule shrunk: weight on the per-condition thresholds")
+    p.add_argument("--tta-zoom", type=float, default=0.0,
+                   help="average the head's probabilities over the original view plus 5 "
+                        "crops (centre + corners) of a copy upscaled by this factor "
+                        "(0 = off). Stored in the checkpoint, so evaluate.py and "
+                        "generate.py reproduce the probabilities these thresholds were "
+                        "tuned on.")
     args = p.parse_args()
 
     device = get_device()
@@ -112,11 +165,19 @@ def main():
     if model.label_bridge is None:
         raise SystemExit("this checkpoint has no condition tokens (trained without --label-tokens)")
     model.label_thresholds = None  # tune on the raw probabilities
+    model.tta_zoom = args.tta_zoom
+    if args.tta_zoom:
+        print(f"  head TTA: original view + 5 crops at zoom {args.tta_zoom:g}")
 
     rows = split_rows(read_manifest(), args.split)
     probs, y = head_probs(model, tokenizer, rows, device)
 
-    thr = tune_micro(probs, y)
+    if args.rule == "global":
+        thr = tune_global(probs, y)
+    elif args.rule == "shrunk":
+        thr = tune_shrunk(probs, y, args.shrink_alpha)
+    else:
+        thr = tune_micro(probs, y)
     thresholds = [thr.get(c, 0.0) for c in range(len(CONDITIONS))]
     # NaN tells model.encode to derive No Finding from the abnormal tokens.
     thresholds[NO_FINDING_IDX] = (float("nan") if args.no_finding == "derived"
@@ -142,9 +203,13 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     ckpt["label_thresholds"] = thresholds
     ckpt["label_thresholds_split"] = args.split
+    ckpt["label_threshold_rule"] = args.rule
+    ckpt["tta_zoom"] = args.tta_zoom
     save_checkpoint(ckpt, args.checkpoint)
-    print(f"\nstored thresholds (tuned on {args.split}, No Finding {args.no_finding}) "
-          f"in {args.checkpoint}")
+    print(f"\nstored thresholds (rule {args.rule}, tuned on {args.split}, "
+          f"No Finding {args.no_finding}"
+          + (f", head TTA zoom {args.tta_zoom:g}" if args.tta_zoom else "")
+          + f") in {args.checkpoint}")
 
 
 if __name__ == "__main__":

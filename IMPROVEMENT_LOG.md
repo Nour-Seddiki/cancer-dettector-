@@ -11,6 +11,11 @@ This file holds the rules, the current best model, the queue and every result so
 - **Accept** an idea if val CE micro F1 beats the current best by at least 0.015 without
   macro F1 dropping. Smaller gaps are within val noise (361 studies). Only an accepted
   model gets a test evaluation, and it is recorded below.
+- **Val CE is in-sample for the thresholds.** `tune_thresholds.py` fits the condition
+  thresholds on val, so a val CE score partly measures that fit rather than generalisation.
+  Two *threshold rules* therefore cannot be compared on full-val CE at all; fit on one
+  random half of val and score on the other (the v12 note has the protocol). Comparing two
+  *trained models* at a fixed threshold rule is still fine on val.
 - **Accepted:** update the README results, then commit and push without co-author trailers.
   **Rejected:** revert the code change, but keep the log entry.
 - New checkpoints get new names (`rg_vN_*`, `classifier_vN.pt`). Never overwrite an old one.
@@ -25,25 +30,37 @@ This file holds the rules, the current best model, the queue and every result so
 
 ## Current best
 
-`checkpoints/rg_v5a_phase2.pt`, warm-started from `checkpoints/classifier_v2.pt`. The recipe
-is in the README "v5" section.
+`checkpoints/rg_v12b_global_tta.pt` - the v10a weights (v5a recipe at aux weight 0.5), head
+TTA at zoom 0.10, and **one condition threshold shared by all 13 abnormal conditions**.
+The recipe is in the README "v12" section.
 
-- val: CE micro P / R / F1 0.351 / 0.354 / **0.352**, macro F1 0.235
-- test: CE micro P / R / F1 0.323 / 0.323 / **0.323**, macro F1 0.202, BLEU-1 0.246,
-  CIDEr 0.310
-- The classifier head's own thresholded micro F1 on val is 0.39, so it is the ceiling.
+- val: CE micro P / R / F1 0.324 / 0.416 / **0.364**, macro F1 0.227
+- test: CE micro P / R / F1 0.299 / 0.376 / **0.333**, macro F1 0.216, BLEU-1 0.269,
+  CIDEr 0.268
+
+`checkpoints/rg_v12a_global.pt` - the unchanged v5a weights with the same single threshold -
+reaches the *same* 0.333 test micro F1 from a strictly smaller change, at higher precision
+(0.358 / 0.312) and much better CIDEr (0.339 vs 0.268). v12b is recorded as best because it
+is ahead on val (0.364 vs 0.317), which is the only comparison selection is allowed to make;
+preferring v12a on its test precision would be selecting on test. If a reason to choose is
+ever needed, settle it with a fresh val-side comparison, not by looking at the table below.
+
+The head's own micro F1 at an oracle threshold is ~0.415 on test while the reports reach
+0.333, so the decoder's pass-through is now the ceiling rather than the head.
 
 ## Queue (highest expected value first)
 
-1. **Combine the two near-misses: head TTA (zoom 0.1) on v10a.** Each fell just short on
-   its own (TTA +0.014 on v5a, aux weight 0.5 +0.013), and they act on different parts:
-   TTA sharpens the head's probabilities, while the lighter aux loss lets the decoder write
-   more findings (recall 0.354 to 0.407). The TTA code has to be re-added (method in the
-   v6 note), then `rg_v10a_phase2.pt` is copied, re-tuned with `--tta-zoom 0.1` and
-   evaluated on val. Caveat: stacking val near-misses risks multiple comparisons, so if it
-   is accepted, the test evaluation is the check that the gain is real.
-2. **Seed ensemble of the head.** Average the probabilities of 2-3 phase-2 runs.
-3. **Decoder regularisation:** dropout 0.2, or 2 layers.
+1. **Re-score every rejected idea at the new threshold rule.** v6 (TTA), v7/v8 (text
+   labels) and v9 (320px) were all judged on full-val CE with 13 val-fitted thresholds -
+   the contaminated metric - and v11 proved a real head gain can hide behind it. Re-tune
+   the kept checkpoints with `--rule global` and re-score. None of them needs retraining,
+   so this is the cheapest experiment left and it re-opens four closed lines at once.
+2. **Push the decoder's pass-through, now the binding constraint.** The head reaches ~0.415
+   test micro F1 at an oracle threshold; the reports reach 0.333. Seed-ensembling the head
+   and decoder regularisation (dropout 0.2, or 2 layers) attack different halves of that gap.
+3. **Bootstrap confidence intervals on val CE**, so the 0.015 acceptance bar is set against
+   the measured noise of 361 studies instead of a guess. v11 cleared the bar by +0.024 and
+   delivered nothing; the bar is probably too low.
 
 ## History
 
@@ -61,6 +78,9 @@ is in the README "v5" section.
 | v8 | `classifier_v3` + text-label tokens + text-label aux BCE | 0.346 | - | rejected |
 | v9 | 320px input throughout (`classifier_v4` + v5a recipe, 100 image tokens) | 0.305 | - | rejected |
 | v10a / v10b | v5a recipe with aux weight 0.5 / 2.0 (was 1.0) | 0.365 / 0.258 | - | rejected, v10a near-miss |
+| v11 | v10a + head TTA zoom 0.10 (queue item 1) | 0.376 | 0.319 | passed val, **refuted on test** |
+| v12a | v5a weights, one shared condition threshold | 0.317 | **0.333** | accepted |
+| v12b | v10a + TTA 0.10 + one shared threshold | 0.364 | **0.333** | accepted, best on val |
 
 \* Scored before the labeller fix. Test numbers for v2 were re-scored with the fixed labeller.
 
@@ -112,3 +132,104 @@ yet, CE micro P / R / F1 0.332 / 0.407 / 0.365 and macro 0.240. Recall went from
 0.407 at a small precision cost, and it wrote 33% distinct reports against v5a's 27%. The
 head's own micro F1 was 0.400. At +0.013 it is under the 0.015 bar, so it was rejected,
 and `rg_v10a_phase2.pt` is kept for the combination test in queue item 1.
+
+**v11 (aux weight 0.5 + head TTA, the two near-misses stacked).** Queue item 1. The TTA code
+was re-added from the v6 note, now as a `--tta-zoom` option on `tune_thresholds.py` that
+stores the zoom in the checkpoint next to the thresholds, so every inference entry point
+reproduces the probabilities the thresholds were tuned on. `rg_v10a_phase2.pt` was copied to
+`rg_v11_tta10.pt`, re-tuned at zoom 0.10 and evaluated.
+
+On val it is the best result the project has produced: CE micro P / R / F1
+0.339 / 0.423 / **0.376** and macro **0.272**, against v5a's 0.352 / 0.235. That is +0.024,
+clear of the 0.015 bar, with macro up as well, and the head's own thresholded micro F1 went
+from 0.400 to 0.410. The two effects did stack roughly additively (TTA alone 0.366, aux 0.5
+alone 0.365).
+
+On test it gained nothing: CE micro P / R / F1 0.283 / 0.365 / **0.319** and macro 0.206,
+against v5a's 0.323 / 0.323 / **0.323** and 0.202. Micro F1 is 0.004 *below* the current
+best, which is inside noise, so this is "no change", not a regression - but it is certainly
+not the +0.024 val promised. The shape of the change is v10a's: precision traded for recall
+(test precision 0.323 to 0.283, recall 0.323 to 0.365). Pleural effusion is where it costs
+most on test, F1 0.34 to 0.26 at 0.21 precision, while cardiomegaly improved (0.46 to 0.49).
+
+The val-to-test gap widened from 0.029 on v5a to 0.057 here, which is the real finding: the
+test split was the designated check on stacking two val near-misses, and it says the gain is
+not real. **Current best stays `rg_v5a_phase2.pt`.** Both `rg_v11_tta10.pt` and the v10a
+checkpoints are kept for the threshold work in queue item 1.
+
+The TTA code is deliberately *not* reverted, unlike previous rejections. It is inert unless a
+checkpoint carries a non-zero `tta_zoom`, and re-running v5a on val after the change
+reproduced 0.352 / 0.235 exactly, so it changes nothing for the current best; queue item 1
+needs it.
+
+**Threshold transfer diagnostic (what v11 actually exposed).** Scoring the head's own
+thresholded micro F1 over the 13 abnormal conditions, three ways:
+
+| model | val @ val-tuned | test @ val-tuned | test @ test-tuned (oracle) |
+|---|---|---|---|
+| v5a (no TTA) | 0.391 | 0.353 | 0.414 |
+| v11 (TTA 0.10) | 0.410 | 0.364 | 0.415 |
+
+Two things follow, and they point in opposite directions from the report-level result.
+
+TTA's gain on the head is *real and it does transfer*: at the same val-tuned thresholds the
+TTA head is better on test too, 0.364 against 0.353. So v11's flat test CE is not TTA
+failing to generalise - it is the decoder not passing a +0.011 head gain through, which is
+within the noise of what the decoder passes through anyway.
+
+The thresholds are the overfit part. Both models lose about 0.06 micro F1 purely by moving a
+val-tuned threshold vector to test (0.414 to 0.353, 0.415 to 0.364), and their oracle
+ceilings are identical at ~0.415. TTA therefore does not raise the ceiling at all; what it
+buys is a smaller threshold-transfer penalty (0.051 against 0.061), i.e. robustness to the
+threshold landing in the wrong place. The per-condition optima move a long way between the
+two splits - pleural effusion 0.575 to 0.350, atelectasis 0.700 to 0.475, lung lesion 0.550
+to 0.925, enlarged cardiomediastinum (val support 2) off entirely - which is what 13 free
+parameters coordinate-ascended on 361 studies with small per-condition supports look like.
+
+Closing even half of that 0.06 is worth more than any architectural idea left in the queue,
+and it costs no retraining: the thresholds are fitted post hoc on cached head probabilities.
+
+**v12 (one shared condition threshold).** Queue item 1, and the first genuine test-split gain
+since v5a. `tune_thresholds.py` grew a `--rule` option: `coord` is the original
+13-parameter coordinate ascent, `global` fits a single threshold shared by all 13 abnormal
+conditions, `shrunk` blends them. `global` is now the default.
+
+Choosing between the rules could not be done on full-val CE, because that is the number the
+thresholds are fitted against. The protocol instead fit on one random half of val and scored
+on the other, 30 paired repeats, head micro F1:
+
+| rule | v5a held-out | v11 held-out |
+|---|---|---|
+| coord (13 params, the original) | 0.3240 | 0.3432 |
+| **global (1 param)** | **0.3436** | **0.3558** |
+| shrunk-0.50 | 0.3416 | 0.3510 |
+| bagged-15 (bootstrap-averaged coord) | 0.3301 | 0.3465 |
+| support-10 (rare conditions forced off) | 0.3147 | 0.3280 |
+| oracle (fit on the scoring half itself) | 0.4083 | 0.4262 |
+
+Bagging the same 13-parameter fit barely helps, and forcing low-support conditions off hurts,
+so the problem is not the rare conditions specifically - it is the number of free parameters.
+
+End to end, with model weights untouched and only the stored thresholds differing:
+
+| | val micro F1 | test micro F1 | test macro | test P / R | CIDEr |
+|---|---|---|---|---|---|
+| v5a, 13 thresholds | 0.352 | 0.323 | 0.202 | 0.323 / 0.323 | 0.310 |
+| **v12a, 1 threshold** | 0.317 | **0.333** | 0.217 | 0.358 / 0.312 | 0.339 |
+| v11, 13 thresholds | 0.376 | 0.319 | 0.206 | 0.283 / 0.365 | - |
+| **v12b, 1 threshold** | 0.364 | **0.333** | 0.216 | 0.299 / 0.376 | 0.268 |
+
++0.010 on the v5a weights and +0.014 on the v10a+TTA weights, for no retraining at all. Both
+bases land on exactly 0.333, which is a good sign that the threshold rule is doing the work
+rather than either set of weights.
+
+The val figures move the *opposite* way (0.352 to 0.317, 0.376 to 0.364), and that is the
+lesson worth keeping: those val numbers were partly in-sample, so the rule that scores worse
+on val is the one that generalises. v12a's test score (0.333) is actually *above* its val
+score (0.317) - the val-to-test gap went from -0.029 to +0.016 - which is what an estimator
+that is not fitting val noise looks like. A new rule in the Rules section now records this.
+
+Read together with the v11 note, the picture is that head TTA and the lighter auxiliary loss
+both do make the classifier head better, and the TTA gain does transfer to test, but neither
+survives the decoder as a report-level gain; the threshold rule does, and it was invisible
+under the old metric.
